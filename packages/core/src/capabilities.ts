@@ -65,6 +65,21 @@ export interface RunCapabilities {
    * raw bytes (the legacy format) for compatibility with older runs.
    */
   framedByteStreams: boolean;
+
+  /**
+   * Whether the target run's deployment understands the `hookInput` field on
+   * the workflow queue invocation payload — i.e. its queue consumer will, on
+   * receiving an invocation carrying `hookInput`, idempotently ensure the
+   * `hook_received` event exists (keyed by `resumeId`) before replaying.
+   *
+   * When true, `resumeHook()` can persist the `hook_received` event and publish
+   * the queue invocation concurrently (the parallel fast path): whichever write
+   * lands second is deduplicated by the `(runId, resumeId)` constraint. When
+   * false, the producer must fall back to the sequential path (persist the
+   * event, then enqueue) because the old consumer ignores `hookInput` and would
+   * replay a run whose `hook_received` event may not exist yet.
+   */
+  supportsHookResumeInput: boolean;
 }
 
 /**
@@ -108,7 +123,17 @@ const CAPABILITY_VERSION_TABLE: ReadonlyArray<{
   // to the next beta. A too-low cutoff makes new producers write framed bytes to
   // consumers that cannot unframe them (silent corruption); too-high merely
   // delays the optimization (safe).
-}> = [{ capability: 'framedByteStreams', minVersion: '5.0.0-beta.15' }];
+}> = [
+  { capability: 'framedByteStreams', minVersion: '5.0.0-beta.15' },
+  // TODO(release): verify this matches the actual version that ships lazy hook
+  // resume (the queue consumer's `hookInput` re-ensure). If a "Version Packages
+  // (beta)" PR merges before this change, bump to the next beta. A too-low
+  // cutoff makes new producers take the parallel path against a consumer that
+  // ignores `hookInput` — the enqueued invocation could then replay a run whose
+  // `hook_received` event hasn't landed yet (a lost resume); too-high merely
+  // keeps producers on the safe sequential path (a latency cost, not a bug).
+  { capability: 'supportsHookResumeInput', minVersion: '5.0.0-beta.39' },
+];
 
 /**
  * The set of formats supported by all specVersion 2 runs, regardless of
@@ -135,6 +160,7 @@ export function getRunCapabilities(
     return {
       supportedFormats: BASELINE_FORMATS,
       framedByteStreams: false,
+      supportsHookResumeInput: false,
     };
   }
 
@@ -149,6 +175,7 @@ export function getRunCapabilities(
   const result: RunCapabilities = {
     supportedFormats: formats,
     framedByteStreams: false,
+    supportsHookResumeInput: false,
   };
 
   for (const { capability, minVersion } of CAPABILITY_VERSION_TABLE) {

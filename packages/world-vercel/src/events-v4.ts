@@ -207,6 +207,17 @@ export interface CreateEventV4Input {
    * without a loaded event log; older servers ignore it entirely.
    */
   stateUpdatedAt?: number;
+  /** Lazy hook resume idempotency key. Set only on a `hook_received` written
+   *  by `resumeHook()`'s parallel fast path; routes the event through the
+   *  server's `(runId, resumeId)` constraint so the direct write and the
+   *  queue consumer's re-ensure converge on one event. Older servers ignore
+   *  it (the deduplication then falls to the sequential path). */
+  resumeId?: string;
+  /** Content digest of the serialized resume payload. Forwarded alongside
+   *  `resumeId` so the direct write and the queue re-ensure record an identical
+   *  digest on the server's `(runId, resumeId)` constraint (the v4 payload ref
+   *  is not content-stable server-side). Older servers ignore it. */
+  resumePayloadDigest?: string;
 }
 
 export interface CreateEventV4Result {
@@ -304,6 +315,10 @@ function buildPostFrameMeta(
   if (input.skipPreload !== undefined) meta.skipPreload = input.skipPreload;
   if (input.stateUpdatedAt !== undefined) {
     meta.stateUpdatedAt = input.stateUpdatedAt;
+  }
+  if (input.resumeId !== undefined) meta.resumeId = input.resumeId;
+  if (input.resumePayloadDigest !== undefined) {
+    meta.resumePayloadDigest = input.resumePayloadDigest;
   }
   return meta;
 }

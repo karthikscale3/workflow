@@ -704,6 +704,22 @@ export type CreateEventRequest = Exclude<
 export interface CreateEventParams {
   v1Compat?: boolean;
   resolveData?: ResolveData;
+  /**
+   * Lazy hook resume idempotency key. Set only by `resumeHook()` when it
+   * persists a `hook_received` event whose creation must be deduplicated
+   * against a concurrent re-ensure from the queue consumer. The World routes
+   * it to the backend's `(runId, resumeId)` constraint so both writers
+   * converge on exactly one event. Only meaningful for `hook_received`.
+   */
+  resumeId?: string;
+  /**
+   * Content digest of the serialized resume payload, computed once by
+   * `resumeHook()` and forwarded identically on the direct write and the queue
+   * re-ensure. The World routes it to the backend so both writers record the
+   * same digest on the `(runId, resumeId)` constraint. Only meaningful
+   * alongside {@link resumeId}.
+   */
+  resumePayloadDigest?: string;
   /** Request ID (x-vercel-id when on Vercel) for correlating request logs with workflow events. */
   requestId?: string;
   /**

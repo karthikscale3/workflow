@@ -12,11 +12,14 @@ import {
   isTerminalWorkflowRunStatus,
   SPEC_VERSION_CURRENT,
   SPEC_VERSION_LEGACY,
+  SPEC_VERSION_SUPPORTS_CBOR_QUEUE_TRANSPORT,
   SPEC_VERSION_SUPPORTS_COMPRESSION,
   type WorkflowInvokePayload,
   type WorkflowRun,
 } from '@workflow/world';
+import { monotonicFactory } from 'ulid';
 import { getRunCapabilities } from '../capabilities.js';
+import { isRetryableWorldError } from '../classify-error.js';
 import { importKey } from '../encryption.js';
 import { runtimeLogger } from '../logger.js';
 import { decodeRunPublicKey } from '../sealed-box.js';
@@ -34,6 +37,39 @@ import { linkToTraceCarrier, trace } from '../telemetry.js';
 import { getWorldLazy } from './get-world-lazy.js';
 import { getWorkflowQueueName } from './helpers.js';
 import { safeWaitUntil, waitedUntil } from './wait-until.js';
+
+/** Monotonic ULID factory for per-call resume idempotency keys. */
+const generateResumeId = monotonicFactory();
+
+/**
+ * Upper bound on the serialized hook payload that the parallel fast path will
+ * inline into the queue message's `hookInput`. Vercel Queues caps a single
+ * message at ~256 KiB, and the message also carries the runId, hookId, token,
+ * resumeId, digest, and trace carrier alongside CBOR framing overhead. Staying
+ * well under that ceiling keeps the queue publish from rejecting an oversized
+ * message — which, on the parallel path, would persist `hook_received` but never
+ * re-trigger the run. Above this size we fall back to the sequential path, whose
+ * queue message carries only the run ID (the payload lives in the event log).
+ */
+const MAX_INLINE_RESUME_PAYLOAD_BYTES = 128 * 1024;
+
+/**
+ * Hex SHA-256 of the serialized resume payload bytes. Computed once by the
+ * producer and forwarded verbatim on both the direct `hook_received` write and
+ * the queue `hookInput`, so both writers of the same `resumeId` record an
+ * identical digest on the server's `(runId, resumeId)` constraint. Hashing the
+ * already-serialized bytes (not the raw value) keeps producer and consumer in
+ * lockstep — the consumer forwards this string without recomputing.
+ */
+async function computeResumePayloadDigest(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  const view = new Uint8Array(digest);
+  let hex = '';
+  for (const b of view) {
+    hex += b.toString(16).padStart(2, '0');
+  }
+  return hex;
+}
 
 /**
  * The resume context for a hook plus where it came from. `run` is present only
@@ -309,70 +345,186 @@ export async function resumeHook<T = any>(
           });
         });
 
-        // Create a hook_received event with the payload
-        try {
-          await world.events.create(
-            hook.runId,
-            {
-              eventType: 'hook_received',
-              specVersion: SPEC_VERSION_CURRENT,
-              correlationId: hook.hookId,
-              eventData: {
-                ...(v1Compat ? {} : { token: hook.token }),
-                payload: dehydratedPayload,
-              },
-            },
-            { v1Compat }
-          );
-        } catch (err) {
-          // Re-key any "hook can no longer be received" rejection to
-          // HookNotFoundError(hook.token) so `.token` matches the
-          // pre-fast-path contract, where resumeHook threw
-          // `HookNotFoundError(hook.token)` after its own terminal check.
-          // The specific error depends on the World:
-          //   - a genuinely missing hook maps to HookNotFoundError (keyed on
-          //     the event correlationId / hook ID);
-          //   - a terminal run on Vercel rejects hook_received with 404, which
-          //     world-vercel maps to HookNotFoundError;
-          //   - a terminal run on world-local / world-postgres rejects with
-          //     RunExpiredError.
-          // EntityConflictError (HTTP 409) is kept for compatibility with
-          // older / conflict-shaped rejection behavior.
-          if (
-            HookNotFoundError.is(err) ||
-            EntityConflictError.is(err) ||
-            RunExpiredError.is(err)
-          ) {
-            throw new HookNotFoundError(hook.token);
-          }
-          throw err;
-        }
-
         span?.setAttributes({
           ...Attribute.WorkflowName(resumeContext.workflowName),
         });
 
         // Link to the run-origin context from the stored trace carrier
-        // (skipped when absent or invalid).
+        // (skipped when absent or invalid). Resolved before dispatch so both
+        // the sequential and parallel paths attach it.
         const originLink = await linkToTraceCarrier(resumeContext.traceCarrier);
         if (originLink) {
           span?.addLink?.(originLink);
         }
 
-        // Re-trigger the workflow against the deployment ID associated
-        // with the workflow run that the hook belongs to
-        await world.queue(
-          getWorkflowQueueName(resumeContext.workflowName),
-          {
-            runId: hook.runId,
-            // attach the trace carrier from the run's resume context
-            traceCarrier: resumeContext.traceCarrier ?? undefined,
-          } satisfies WorkflowInvokePayload,
-          {
-            deploymentId: resumeContext.deploymentId,
-            specVersion: resumeContext.runSpecVersion ?? SPEC_VERSION_LEGACY,
+        const eventData = {
+          ...(v1Compat ? {} : { token: hook.token }),
+          payload: dehydratedPayload,
+        };
+
+        const queueName = getWorkflowQueueName(resumeContext.workflowName);
+        const queueOptions = {
+          deploymentId: resumeContext.deploymentId,
+          specVersion: resumeContext.runSpecVersion ?? SPEC_VERSION_LEGACY,
+        };
+
+        // Parallelize the `hook_received` write and the queue publish only when
+        // the target run's deployment understands `hookInput` (so the queue
+        // consumer idempotently re-ensures the event) AND the run uses CBOR
+        // queue transport (so the binary payload survives the queue) AND the
+        // serialized payload is small enough to inline into the queue message.
+        // The dehydrated payload must be raw bytes for the content digest that
+        // keys the server's dedup constraint. A payload larger than the queue's
+        // message ceiling would fail the publish (and thus never re-trigger the
+        // run), so anything above the bound — like everything else that doesn't
+        // qualify — falls back to the historical sequential path (write, then
+        // publish only the run ID).
+        const useParallelResume =
+          capabilities.supportsHookResumeInput &&
+          dehydratedPayload instanceof Uint8Array &&
+          dehydratedPayload.byteLength <= MAX_INLINE_RESUME_PAYLOAD_BYTES &&
+          (resumeContext.runSpecVersion ?? 0) >=
+            SPEC_VERSION_SUPPORTS_CBOR_QUEUE_TRANSPORT;
+
+        span?.setAttributes({
+          'workflow.hook.resume_strategy': useParallelResume
+            ? 'parallel'
+            : 'sequential',
+        });
+
+        // Re-key any "hook can no longer be received" rejection to
+        // HookNotFoundError(hook.token) so `.token` matches the pre-fast-path
+        // contract, where resumeHook threw `HookNotFoundError(hook.token)`
+        // after its own terminal check. The specific error depends on the
+        // World:
+        //   - a genuinely missing hook maps to HookNotFoundError (keyed on the
+        //     event correlationId / hook ID);
+        //   - a terminal run on Vercel rejects hook_received with 404, which
+        //     world-vercel maps to HookNotFoundError;
+        //   - a terminal run on world-local / world-postgres rejects with
+        //     RunExpiredError.
+        //
+        // On the SEQUENTIAL path an EntityConflictError (HTTP 409) is also
+        // treated as "hook gone" for historical / conflict-shaped-rejection
+        // compatibility: there is no queue message in flight, so a conflict has
+        // no re-ensuring consumer to converge on. The PARALLEL path handles 409
+        // differently (see below) — it published the queue message before the
+        // conflict, so the consumer will converge the event.
+        const isHookGoneError = (err: unknown): boolean =>
+          HookNotFoundError.is(err) ||
+          EntityConflictError.is(err) ||
+          RunExpiredError.is(err);
+
+        if (!useParallelResume) {
+          // Sequential path: create a hook_received event, then re-trigger.
+          try {
+            await world.events.create(
+              hook.runId,
+              {
+                eventType: 'hook_received',
+                specVersion: SPEC_VERSION_CURRENT,
+                correlationId: hook.hookId,
+                eventData,
+              },
+              { v1Compat }
+            );
+          } catch (err) {
+            if (isHookGoneError(err)) {
+              throw new HookNotFoundError(hook.token);
+            }
+            throw err;
           }
+
+          await world.queue(
+            queueName,
+            {
+              runId: hook.runId,
+              traceCarrier: resumeContext.traceCarrier ?? undefined,
+            } satisfies WorkflowInvokePayload,
+            queueOptions
+          );
+
+          return hook;
+        }
+
+        // Parallel fast path. A stable idempotency key ties the direct write to
+        // the queue consumer's re-ensure; the payload digest lets the server
+        // detect key reuse across byte-identical payloads.
+        const resumeId = generateResumeId();
+        const payloadDigest = await computeResumePayloadDigest(
+          dehydratedPayload as Uint8Array
         );
+        span?.setAttributes({ 'workflow.hook.resume_id': resumeId });
+
+        const [eventResult, queueResult] = await Promise.allSettled([
+          world.events.create(
+            hook.runId,
+            {
+              eventType: 'hook_received',
+              specVersion: SPEC_VERSION_CURRENT,
+              correlationId: hook.hookId,
+              eventData,
+            },
+            { v1Compat, resumeId, resumePayloadDigest: payloadDigest }
+          ),
+          world.queue(
+            queueName,
+            {
+              runId: hook.runId,
+              traceCarrier: resumeContext.traceCarrier ?? undefined,
+              hookInput: {
+                resumeId,
+                hookId: hook.hookId,
+                token: hook.token,
+                payload: dehydratedPayload,
+                payloadDigest,
+              },
+            } satisfies WorkflowInvokePayload,
+            queueOptions
+          ),
+        ]);
+
+        // Queue failure is always fatal — the run was not re-triggered, so no
+        // consumer will re-ensure the event.
+        if (queueResult.status === 'rejected') {
+          throw queueResult.reason;
+        }
+
+        if (eventResult.status === 'rejected') {
+          const err = eventResult.reason;
+          if (HookNotFoundError.is(err) || RunExpiredError.is(err)) {
+            // The hook's run has genuinely ended: surface the same contract as
+            // the sequential path. The queue message already went out, but the
+            // consumer's re-ensure will also reject against the terminal run
+            // and no-op, so the workflow does not resume.
+            throw new HookNotFoundError(hook.token);
+          }
+          if (EntityConflictError.is(err) || isRetryableWorldError(err)) {
+            // Resilient. Two shapes reach here, both non-terminal:
+            //   - EntityConflict (409): this write raced its own re-ensuring
+            //     consumer (or a redrive) on the shared `resumeId` — the run is
+            //     NOT gone, and the consumer converges on the one committed
+            //     event. Unlike the sequential path, a 409 here is expected
+            //     concurrency, not a vanished hook.
+            //   - 429 / 5xx / transport: a transient backend failure.
+            // In both cases the run WAS re-triggered via the queue and the
+            // consumer idempotently ensures the hook_received before replay, so
+            // swallow rather than failing the caller.
+            runtimeLogger.warn(
+              'Hook resume event write failed, but the run was re-triggered via ' +
+                'the queue. The hook_received event will be ensured by the ' +
+                'queue consumer.',
+              {
+                workflowRunId: hook.runId,
+                hookId: hook.hookId,
+                resumeId,
+                error: err instanceof Error ? err.message : String(err),
+              }
+            );
+          } else {
+            throw err;
+          }
+        }
 
         return hook;
       } catch (err) {

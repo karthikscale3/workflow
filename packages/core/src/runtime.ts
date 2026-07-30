@@ -3,6 +3,7 @@ import {
   CorruptedEventLogError,
   EntityConflictError,
   FatalError,
+  HookNotFoundError,
   MaxEventsExceededError,
   PreconditionFailedError,
   ReplayDivergenceError,
@@ -38,6 +39,7 @@ import { type StepInvocationQueueItem, WorkflowSuspension } from './global.js';
 import { runtimeLogger } from './logger.js';
 import { getStepFunction } from './private.js';
 import { ReplayPayloadCache } from './replay-payload-cache.js';
+import { COMPUTE_INSTANCE_ID } from './runtime/compute-instance.js';
 import {
   getMaxEventsOverride,
   getMaxQueueDeliveries,
@@ -65,7 +67,6 @@ import {
   handleReplayBudgetExhausted,
   ReplayBudget,
 } from './runtime/replay-budget.js';
-import { COMPUTE_INSTANCE_ID } from './runtime/compute-instance.js';
 import { runIdCreatedAt } from './runtime/run-id-time.js';
 import {
   DEFAULT_STEP_MAX_RETRIES,
@@ -376,6 +377,7 @@ export function workflowEntrypoint(
           stepName: incomingStepName,
           replayDivergence,
           runInput,
+          hookInput,
         } = WorkflowInvokePayloadSchema.parse(message_);
         // `start()` always attaches a trace carrier, but
         // serializeTraceCarrier() returns `{}` when no OTEL SDK is registered
@@ -1168,6 +1170,69 @@ export function workflowEntrypoint(
                       }
                     } // end else (non-turbo run_started)
                   } // end if (!workflowRun)
+
+                  // Lazy hook resume: the producer (resumeHook fast path)
+                  // parallelized the `hook_received` write with this queue
+                  // publish, so the event may not be persisted yet. Idempotently
+                  // ensure it before replay — keyed by `resumeId` so a
+                  // concurrent producer write converges on exactly one event
+                  // (the server resolves a matching claim as success, not an
+                  // error). `hookInput` never rides a turbo first-delivery
+                  // (that path carries `runInput`, not `hookInput`), so this
+                  // only runs on the normal load-and-replay path.
+                  if (hookInput) {
+                    try {
+                      await world.events.create(
+                        runId,
+                        {
+                          eventType: 'hook_received',
+                          specVersion: SPEC_VERSION_CURRENT,
+                          correlationId: hookInput.hookId,
+                          eventData: {
+                            token: hookInput.token,
+                            payload: hookInput.payload,
+                          },
+                        },
+                        {
+                          requestId,
+                          resumeId: hookInput.resumeId,
+                          resumePayloadDigest: hookInput.payloadDigest,
+                        }
+                      );
+                    } catch (err) {
+                      // A matching concurrent claim (same resumeId + digest) is
+                      // resolved as success server-side and never throws, so
+                      // anything caught here is a genuine terminal or transient
+                      // condition:
+                      //
+                      // - HookNotFound / RunExpired: the producer's direct write
+                      //   already ended this resume's eligibility (the run went
+                      //   terminal). There is nothing left to resume, so consume
+                      //   the message and stop. Continuing to replay would be
+                      //   wasted work — and, worse, would ack a delivery that may
+                      //   carry the only copy of the payload.
+                      if (
+                        HookNotFoundError.is(err) ||
+                        RunExpiredError.is(err)
+                      ) {
+                        return;
+                      }
+                      // - EntityConflict (and any other unexpected error): the
+                      //   resumeId constraint exists but the matching event is
+                      //   not yet observable — the producer's parallel write is
+                      //   still in flight, or a redrive raced the claim. This is
+                      //   transient: rethrow so the queue redelivers and a later
+                      //   attempt converges on the committed event instead of
+                      //   replaying (and acking) without the payload.
+                      throw err;
+                    }
+                    // The run_started response preloaded the log BEFORE this
+                    // ensure, so it cannot include the hook_received. Drop the
+                    // preloaded set to force a fresh events.list that observes
+                    // the committed event on the first replay iteration.
+                    preloadedEvents = undefined;
+                    preloadedEventsCursor = undefined;
+                  }
 
                   // Resolve the encryption key for this run's deployment.
                   // Used eagerly here since both runWorkflow (input

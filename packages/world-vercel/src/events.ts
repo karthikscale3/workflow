@@ -721,6 +721,15 @@ async function createWorkflowRunEventInner(
       // skip the list+resolve. The server only acts on it for run_started;
       // older servers ignore it and simply preload as before.
       ...(params?.skipPreload ? { skipPreload: true } : {}),
+      // Lazy hook resume idempotency key (hook_received only). Routes the
+      // write through the server's (runId, resumeId) constraint so a
+      // concurrent queue-consumer re-ensure deduplicates to one event.
+      ...(params?.resumeId ? { resumeId: params.resumeId } : {}),
+      // Content digest forwarded alongside resumeId so the direct write and the
+      // queue re-ensure record an identical digest on the server constraint.
+      ...(params?.resumePayloadDigest
+        ? { resumePayloadDigest: params.resumePayloadDigest }
+        : {}),
       remoteRefBehavior,
       payload,
       ...meta,

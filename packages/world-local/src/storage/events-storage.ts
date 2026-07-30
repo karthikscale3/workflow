@@ -265,6 +265,36 @@ async function findExistingHookCreatedEventId(
 }
 
 /**
+ * Probe the run's event log for an existing `hook_received` event with the
+ * given correlationId. Used to make lazy-resume `hook_received` writes
+ * idempotent: `resumeHook()`'s parallel fast path issues the direct
+ * `events.create` and a queue publish concurrently, and the queue consumer
+ * re-ensures the same event — so both can arrive here for one hook. A hook is
+ * received exactly once, so any existing `hook_received` for this hook is the
+ * same logical resume; returning it (instead of appending a second event)
+ * keeps the event log free of the duplicate that would otherwise diverge every
+ * subsequent replay. Mirrors the server's `(runId, resumeId)` constraint.
+ */
+async function findExistingHookReceivedEvent(
+  basedir: string,
+  runId: string,
+  correlationId: string
+): Promise<Event | null> {
+  const result = await paginatedFileSystemQuery({
+    directory: path.join(basedir, 'events'),
+    schema: EventSchema,
+    filePrefix: `${runId}-`,
+    filter: (event) =>
+      event.eventType === 'hook_received' &&
+      event.correlationId === correlationId,
+    limit: 1,
+    getCreatedAt: getObjectCreatedAt('evnt'),
+    getId: (event) => event.eventId,
+  });
+  return result.data[0] ?? null;
+}
+
+/**
  * Repair an "event-first orphan": the hook entity write is deferred
  * until after the `hook_created` event publish commits (so a failed
  * publish cannot mutate already-committed state — see the comment on
@@ -1033,6 +1063,24 @@ export function createEventsStorage(
 
           if (!existingHook) {
             throw new HookNotFoundError(data.correlationId);
+          }
+
+          // Lazy hook resume idempotency: the parallel fast path writes this
+          // `hook_received` directly AND has the queue consumer re-ensure it,
+          // so both may reach here for one hook under this per-hook lock. A
+          // hook is received exactly once, so an existing `hook_received` for
+          // this hook is the same logical resume — return it instead of
+          // appending a duplicate that would diverge every replay. Gated on
+          // `resumeId` so the historical single-write path is untouched.
+          if (data.eventType === 'hook_received' && params?.resumeId) {
+            const existing = await findExistingHookReceivedEvent(
+              basedir,
+              effectiveRunId,
+              data.correlationId
+            );
+            if (existing) {
+              return { event: existing };
+            }
           }
         }
         // `event` may be reassigned later in the `hook_created`
