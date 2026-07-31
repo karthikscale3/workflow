@@ -6,6 +6,8 @@ import {
   WorkflowRuntimeError,
 } from '@workflow/errors';
 import {
+  HOOK_RESUME_DEDUP_VERSION,
+  HOOK_RESUME_INPUT_VERSION,
   type Hook,
   type HookResumeContext,
   isLegacySpecVersion,
@@ -87,6 +89,7 @@ interface HookResumeInfo {
 function resumeContextFromRun(run: WorkflowRun): HookResumeContext {
   const coreVersion = run.executionContext?.workflowCoreVersion;
   const traceCarrier = run.executionContext?.traceCarrier;
+  const hookResumeInputVersion = run.executionContext?.hookResumeInputVersion;
   return {
     deploymentId: run.deploymentId,
     workflowName: run.workflowName,
@@ -98,6 +101,10 @@ function resumeContextFromRun(run: WorkflowRun): HookResumeContext {
         ? (traceCarrier as HookResumeContext['traceCarrier'])
         : undefined,
     encryptionPublicKey: run.encryptionPublicKey,
+    hookResumeInputVersion:
+      typeof hookResumeInputVersion === 'number'
+        ? hookResumeInputVersion
+        : undefined,
   };
 }
 
@@ -226,15 +233,46 @@ export async function resumeHook<T = any>(
   payload: T,
   encryptionKeyOverride?: PayloadKey
 ): Promise<Hook> {
+  // Public entry point. It never attests hook freshness, so a Hook object
+  // supplied here — which may carry a `resumeCapabilities` cached before a
+  // server rollback or kill switch — is ignored by the dynamic-dedup gate and
+  // fails closed to the sequential path. Only `resumeWebhook`, which fetches
+  // the hook by token in-line during the same resume, reaches the internal
+  // implementation with the fresh attestation set. Keeping the freshness flag
+  // off the exported signature prevents a caller from passing a stale Hook plus
+  // `true` and reactivating dynamic dedup against a rolled-back backend.
+  return resumeHookImpl(tokenOrHook, payload, encryptionKeyOverride, false);
+}
+
+/**
+ * Internal implementation of {@link resumeHook}. NOT exported: the
+ * `hookFreshlyLookedUp` attestation must never be reachable by public callers
+ * (see the wrapper above).
+ *
+ * @param hookFreshlyLookedUp - Attests that a supplied Hook object was fetched
+ *   by token during THIS resume, so its response-only `resumeCapabilities`
+ *   reflects the live backend and may be trusted for the dynamic-dedup gate.
+ *   A token string is always fetched fresh here, so it is implicitly fresh.
+ */
+async function resumeHookImpl<T = any>(
+  tokenOrHook: string | Hook,
+  payload: T,
+  encryptionKeyOverride: PayloadKey | undefined,
+  hookFreshlyLookedUp: boolean
+): Promise<Hook> {
   return await waitedUntil(() => {
     return trace('hook.resume', async (span) => {
       const world = await getWorldLazy();
 
       try {
-        const hook: Hook =
-          typeof tokenOrHook === 'string'
-            ? await world.hooks.getByToken(tokenOrHook)
-            : tokenOrHook;
+        const suppliedToken = typeof tokenOrHook === 'string';
+        const hook: Hook = suppliedToken
+          ? await world.hooks.getByToken(tokenOrHook)
+          : tokenOrHook;
+        // The dynamic, response-only `resumeCapabilities` may only be trusted
+        // when it came from a by-token lookup performed during this resume.
+        const hookResumeCapabilitiesAreFresh =
+          suppliedToken || hookFreshlyLookedUp;
 
         const info = await resolveHookResumeInfo(hook);
         const { resumeContext } = info;
@@ -368,28 +406,86 @@ export async function resumeHook<T = any>(
           specVersion: resumeContext.runSpecVersion ?? SPEC_VERSION_LEGACY,
         };
 
-        // Parallelize the `hook_received` write and the queue publish only when
-        // the target run's deployment understands `hookInput` (so the queue
-        // consumer idempotently re-ensures the event) AND the run uses CBOR
-        // queue transport (so the binary payload survives the queue) AND the
-        // serialized payload is small enough to inline into the queue message.
-        // The dehydrated payload must be raw bytes for the content digest that
-        // keys the server's dedup constraint. A payload larger than the queue's
-        // message ceiling would fail the publish (and thus never re-trigger the
-        // run), so anything above the bound — like everything else that doesn't
-        // qualify — falls back to the historical sequential path (write, then
-        // publish only the run ID).
-        const useParallelResume =
-          capabilities.supportsHookResumeInput &&
-          dehydratedPayload instanceof Uint8Array &&
-          dehydratedPayload.byteLength <= MAX_INLINE_RESUME_PAYLOAD_BYTES &&
-          (resumeContext.runSpecVersion ?? 0) >=
-            SPEC_VERSION_SUPPORTS_CBOR_QUEUE_TRANSPORT;
+        // Decide whether to parallelize the `hook_received` write and the queue
+        // publish. The fast path is only safe when EVERY precondition holds; the
+        // first that fails names the fallback reason (emitted as a span
+        // attribute for observability, and to make "why did this run sequential"
+        // answerable in production). All conditions:
+        //
+        //  - kill switch: `WORKFLOW_DISABLE_LAZY_HOOK_RESUME` forces sequential
+        //    if the fast path ever misbehaves. It is an SDK-deployment env var,
+        //    so changing it generally requires redeploying the workflow
+        //    deployment. (The backend can independently drop new resumes to the
+        //    sequential path fleet-wide by ceasing to attest dedup support on
+        //    the by-token lookup — see the backend-dedup condition below.)
+        //  - backend dedup: the live backend must enforce the
+        //    `(runId, resumeId)` constraint, or the two writers would commit two
+        //    `hook_received` events. Fail closed. Attested by EITHER a fresh,
+        //    response-only `hook.resumeCapabilities.hookResumeDedupVersion` from
+        //    the by-token lookup (world-vercel — recomputed every read, so a
+        //    server rollback or kill switch drops to sequential immediately) OR
+        //    the static `world.capabilities.hookResumeDedup` (world-local, whose
+        //    adapter and backend ship together). The response-only capability is
+        //    trusted ONLY when the hook was looked up by token during this
+        //    resume (`hookResumeCapabilitiesAreFresh`); a Hook object handed in
+        //    by a public caller may carry a capability cached before a rollback,
+        //    so it is ignored and the path falls back to sequential.
+        //  - consumer support: the target run's deployment must re-ensure the
+        //    event from `hookInput` on replay. Attested by the run's explicit
+        //    `hookResumeInputVersion` execution-context marker (mirrored onto
+        //    resumeContext), NOT a version-compare against a predicted release
+        //    cutoff. Absent → a lost producer write would be a lost resume.
+        //  - not legacy: v1Compat runs omit `token` from the producer's event
+        //    body but the consumer's re-ensure always includes it, so the two
+        //    writers would disagree on the event body. Legacy stays sequential.
+        //  - CBOR transport: the run must use CBOR queue transport so the binary
+        //    payload survives the queue message.
+        //  - raw bytes: the dehydrated payload must be a `Uint8Array` (the
+        //    content digest that keys the dedup constraint is over these bytes).
+        //  - size: a payload above the queue's message ceiling would fail the
+        //    publish — which, on the parallel path, would persist the event but
+        //    never re-trigger the run — so oversized payloads stay sequential
+        //    (their queue message carries only the run ID).
+        const parallelResumeDisabled =
+          process.env.WORKFLOW_DISABLE_LAZY_HOOK_RESUME === '1';
+        // Backend dedup is supported when EITHER the live server attests it
+        // fresh on this by-token hook (world-vercel: response-only, recomputed
+        // every read, so rollback/kill-switch take effect immediately) OR the
+        // static world capability is set (world-local: adapter + backend ship
+        // together). Both are re-evaluated per resume, so every rollout and
+        // rollback direction degrades safely to the sequential path.
+        const backendDedupSupported =
+          (hookResumeCapabilitiesAreFresh
+            ? (hook.resumeCapabilities?.hookResumeDedupVersion ?? 0)
+            : 0) >= HOOK_RESUME_DEDUP_VERSION ||
+          world.capabilities?.hookResumeDedup === true;
+        const fallbackReason: string | null = parallelResumeDisabled
+          ? 'disabled'
+          : !backendDedupSupported
+            ? 'backend_unsupported'
+            : (resumeContext.hookResumeInputVersion ?? 0) <
+                HOOK_RESUME_INPUT_VERSION
+              ? 'consumer_unsupported'
+              : v1Compat
+                ? 'legacy'
+                : (resumeContext.runSpecVersion ?? 0) <
+                    SPEC_VERSION_SUPPORTS_CBOR_QUEUE_TRANSPORT
+                  ? 'non_cbor_transport'
+                  : !(dehydratedPayload instanceof Uint8Array)
+                    ? 'non_bytes'
+                    : dehydratedPayload.byteLength >
+                        MAX_INLINE_RESUME_PAYLOAD_BYTES
+                      ? 'oversized'
+                      : null;
+        const useParallelResume = fallbackReason === null;
 
         span?.setAttributes({
           'workflow.hook.resume_strategy': useParallelResume
             ? 'parallel'
             : 'sequential',
+          ...(fallbackReason
+            ? { 'workflow.hook.resume_fallback_reason': fallbackReason }
+            : {}),
         });
 
         // Re-key any "hook can no longer be received" rejection to
@@ -616,7 +712,12 @@ export async function resumeWebhook(
     response = new Response(null, { status: 202 });
   }
 
-  await resumeHook(hook, request, encryptionKey);
+  // `hook` was just fetched via `getHookByTokenWithKey` (a fresh by-token
+  // lookup) above, so its response-only `resumeCapabilities` reflects the live
+  // backend — call the internal implementation with the fresh attestation so
+  // the parallel fast path stays available without a second GET. (The public
+  // `resumeHook` never sets this, so a caller cannot forge it.)
+  await resumeHookImpl(hook, request, encryptionKey, true);
 
   if (responseReadable) {
     // Wait for the readable stream to emit one chunk,

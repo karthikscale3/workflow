@@ -5,6 +5,8 @@ import {
   ThrottleError,
 } from '@workflow/errors';
 import {
+  HOOK_RESUME_DEDUP_VERSION,
+  HOOK_RESUME_INPUT_VERSION,
   type Hook,
   SPEC_VERSION_CURRENT,
   SPEC_VERSION_SUPPORTS_CBOR_QUEUE_TRANSPORT,
@@ -12,7 +14,7 @@ import {
 } from '@workflow/world';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { dehydrateStepReturnValue } from '../serialization.js';
-import { resumeHook } from './resume-hook.js';
+import { resumeHook, resumeWebhook } from './resume-hook.js';
 import { setWorld } from './world.js';
 
 vi.mock('@vercel/functions', () => ({ waitUntil: vi.fn() }));
@@ -45,26 +47,32 @@ describe('resumeHook (parallel fast path)', () => {
     projectId: 'project_1',
     environment: 'production',
     createdAt: new Date(),
+    // Non-legacy run: v1Compat is false, so the parallel path is eligible.
+    specVersion: SPEC_VERSION_CURRENT,
   } satisfies Hook;
 
-  // workflowCoreVersion 5.0.0 >= 5.0.0-beta.39 minVersion, so
-  // supportsHookResumeInput is on. Combined with a CBOR-transport spec version
-  // and raw-byte payload, resumeHook takes the parallel path.
+  // The run carries an explicit `hookResumeInputVersion` marker (its creating
+  // deployment re-ensures from `hookInput`). Combined with a backend that
+  // declares `hookResumeDedup`, a CBOR-transport spec version, and a raw-byte
+  // payload, resumeHook takes the parallel path.
   const parallelContext = {
     deploymentId: 'deployment_par',
     workflowName: 'processOrder',
     runSpecVersion: SPEC_VERSION_CURRENT,
     workflowCoreVersion: '5.0.0',
+    hookResumeInputVersion: HOOK_RESUME_INPUT_VERSION,
   };
 
   const makeWorld = (
     hook: Hook,
-    overrides: Partial<Record<string, ReturnType<typeof vi.fn>>> = {}
+    overrides: Partial<Record<string, ReturnType<typeof vi.fn>>> = {},
+    capabilities: World['capabilities'] = { hookResumeDedup: true }
   ) => {
     const createEvent = overrides.createEvent ?? vi.fn();
     const queue = overrides.queue ?? vi.fn();
     setWorld({
       specVersion: SPEC_VERSION_CURRENT,
+      capabilities,
       hooks: { getByToken: vi.fn().mockResolvedValue(hook) },
       runs: { get: vi.fn() },
       events: { create: createEvent },
@@ -180,6 +188,68 @@ describe('resumeHook (parallel fast path)', () => {
     expect(queue).toHaveBeenCalledTimes(1);
   });
 
+  it('forces the sequential path when WORKFLOW_DISABLE_LAZY_HOOK_RESUME=1 despite every other precondition passing', async () => {
+    // The operational kill switch must win over an otherwise fully fast-path-
+    // eligible resume (marker present, dedup-capable backend, CBOR transport,
+    // raw-byte payload). Follows the SDK convention of other disable flags
+    // (e.g. WORKFLOW_DISABLE_COMPRESSION): enabled by default, strict '1'.
+    const ORIG = process.env.WORKFLOW_DISABLE_LAZY_HOOK_RESUME;
+    process.env.WORKFLOW_DISABLE_LAZY_HOOK_RESUME = '1';
+    try {
+      const hook = {
+        ...baseHook,
+        resumeContext: parallelContext,
+      } satisfies Hook;
+      const { createEvent, queue } = makeWorld(hook);
+
+      await resumeHook(hook.token, { foo: 'bar' });
+
+      // Sequential: no shared idempotency key on the write, no hookInput on the
+      // queue message — the payload rides the event log.
+      expect(createEvent).toHaveBeenCalledTimes(1);
+      const [, , optsArg] = createEvent.mock.calls[0];
+      expect(optsArg.resumeId).toBeUndefined();
+      expect(optsArg.resumePayloadDigest).toBeUndefined();
+
+      expect(queue).toHaveBeenCalledTimes(1);
+      const [, payloadArg] = queue.mock.calls[0];
+      expect(payloadArg.hookInput).toBeUndefined();
+    } finally {
+      if (ORIG === undefined) {
+        delete process.env.WORKFLOW_DISABLE_LAZY_HOOK_RESUME;
+      } else {
+        process.env.WORKFLOW_DISABLE_LAZY_HOOK_RESUME = ORIG;
+      }
+    }
+  });
+
+  it('does NOT force sequential for values other than the exact string "1"', async () => {
+    // Strict comparison: only '1' disables. A stray 'true'/'0'/'' must leave
+    // the fast path enabled, matching the other WORKFLOW_DISABLE_* flags.
+    const ORIG = process.env.WORKFLOW_DISABLE_LAZY_HOOK_RESUME;
+    process.env.WORKFLOW_DISABLE_LAZY_HOOK_RESUME = 'true';
+    try {
+      const hook = {
+        ...baseHook,
+        resumeContext: parallelContext,
+      } satisfies Hook;
+      const { createEvent, queue } = makeWorld(hook);
+
+      await resumeHook(hook.token, { foo: 'bar' });
+
+      const [, , optsArg] = createEvent.mock.calls[0];
+      expect(optsArg.resumeId).toEqual(expect.any(String));
+      const [, payloadArg] = queue.mock.calls[0];
+      expect(payloadArg.hookInput).toBeDefined();
+    } finally {
+      if (ORIG === undefined) {
+        delete process.env.WORKFLOW_DISABLE_LAZY_HOOK_RESUME;
+      } else {
+        process.env.WORKFLOW_DISABLE_LAZY_HOOK_RESUME = ORIG;
+      }
+    }
+  });
+
   it('falls back to the sequential path when the payload exceeds the inline queue bound', async () => {
     // A payload larger than the queue's inline ceiling would fail the oversized
     // publish on the parallel path, persisting hook_received but never
@@ -203,19 +273,20 @@ describe('resumeHook (parallel fast path)', () => {
     expect(payloadArg.hookInput).toBeUndefined();
   });
 
-  it('falls back to the sequential path when the target deployment lacks hookInput support', async () => {
-    // Older core version → supportsHookResumeInput is false. Even with raw-byte
-    // payloads and CBOR transport, resumeHook writes then publishes and carries
-    // neither resumeId nor hookInput.
+  it('falls back to the sequential path when the run lacks the hookResumeInput marker', async () => {
+    // The run's creating deployment did not stamp `hookResumeInputVersion`, so
+    // its queue consumer will NOT re-ensure hook_received from hookInput. Even
+    // with a dedup-capable backend, raw-byte payloads, and CBOR transport,
+    // resumeHook writes then publishes and carries neither resumeId nor
+    // hookInput — the payload rides the event log.
     expect(SPEC_VERSION_CURRENT).toBeGreaterThanOrEqual(
       SPEC_VERSION_SUPPORTS_CBOR_QUEUE_TRANSPORT
     );
+    const { hookResumeInputVersion: _omit, ...contextWithoutMarker } =
+      parallelContext;
     const hook = {
       ...baseHook,
-      resumeContext: {
-        ...parallelContext,
-        workflowCoreVersion: '5.0.0-beta.38',
-      },
+      resumeContext: contextWithoutMarker,
     } satisfies Hook;
     const { createEvent, queue } = makeWorld(hook);
 
@@ -227,6 +298,176 @@ describe('resumeHook (parallel fast path)', () => {
     expect(optsArg.resumePayloadDigest).toBeUndefined();
 
     expect(queue).toHaveBeenCalledTimes(1);
+    const [, payloadArg] = queue.mock.calls[0];
+    expect(payloadArg.hookInput).toBeUndefined();
+  });
+
+  it('falls back to the sequential path for a legacy (v1Compat) run', async () => {
+    // A legacy run omits `token` from the producer's event body, but the queue
+    // consumer's re-ensure always includes it — the two writers would disagree
+    // on the event body. Legacy runs must stay sequential regardless of every
+    // other precondition.
+    const hook = {
+      ...baseHook,
+      specVersion: 1,
+      resumeContext: parallelContext,
+    } satisfies Hook;
+    const { createEvent, queue } = makeWorld(hook);
+
+    await resumeHook(hook.token, { foo: 'bar' });
+
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    const [, , optsArg] = createEvent.mock.calls[0];
+    expect(optsArg.resumeId).toBeUndefined();
+    expect(optsArg.resumePayloadDigest).toBeUndefined();
+
+    expect(queue).toHaveBeenCalledTimes(1);
+    const [, payloadArg] = queue.mock.calls[0];
+    expect(payloadArg.hookInput).toBeUndefined();
+  });
+
+  it('falls back to the sequential path when the backend does not declare hookResumeDedup', async () => {
+    // The target runtime supports lazy resume (marker present, CBOR transport,
+    // raw bytes) but the World backend has not opted in — e.g. Postgres, which
+    // has no (runId, resumeId) dedup. resumeHook must fail closed to the
+    // sequential path so the two writers can never diverge.
+    const hook = { ...baseHook, resumeContext: parallelContext } satisfies Hook;
+    const { createEvent, queue } = makeWorld(
+      hook,
+      {},
+      { hookResumeDedup: false }
+    );
+
+    await resumeHook(hook.token, { foo: 'bar' });
+
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    const [, , optsArg] = createEvent.mock.calls[0];
+    expect(optsArg.resumeId).toBeUndefined();
+    expect(optsArg.resumePayloadDigest).toBeUndefined();
+
+    expect(queue).toHaveBeenCalledTimes(1);
+    const [, payloadArg] = queue.mock.calls[0];
+    expect(payloadArg.hookInput).toBeUndefined();
+  });
+
+  it('takes the parallel path on a dynamic backend attestation (resumeCapabilities) with no static capability', async () => {
+    // world-vercel no longer declares the static `hookResumeDedup`; it attests
+    // dedup support FRESH per by-token lookup via the response-only
+    // `resumeCapabilities`. The parallel path must engage on that signal alone,
+    // with an otherwise-empty World capability set.
+    const hook = {
+      ...baseHook,
+      resumeContext: parallelContext,
+      resumeCapabilities: { hookResumeDedupVersion: HOOK_RESUME_DEDUP_VERSION },
+    } satisfies Hook;
+    const { createEvent, queue } = makeWorld(hook, {}, {});
+
+    await resumeHook(hook.token, { foo: 'bar' });
+
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    const [, , optsArg] = createEvent.mock.calls[0];
+    expect(optsArg.resumeId).toEqual(expect.any(String));
+    expect(optsArg.resumePayloadDigest).toMatch(/^[0-9a-f]{64}$/);
+
+    expect(queue).toHaveBeenCalledTimes(1);
+    const [, payloadArg] = queue.mock.calls[0];
+    expect(payloadArg.hookInput).toBeDefined();
+  });
+
+  it('falls back to sequential when neither the static capability nor resumeCapabilities attest dedup (rollback / kill switch)', async () => {
+    // A rolled-back or kill-switched server returns a hook with no
+    // `resumeCapabilities`, and world-vercel declares no static capability.
+    // With both attestations absent, resumeHook must fail closed — every new
+    // resume degrades to the single-writer path with no stranded hooks.
+    const hook = { ...baseHook, resumeContext: parallelContext } satisfies Hook;
+    const { createEvent, queue } = makeWorld(hook, {}, {});
+
+    await resumeHook(hook.token, { foo: 'bar' });
+
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    const [, , optsArg] = createEvent.mock.calls[0];
+    expect(optsArg.resumeId).toBeUndefined();
+    expect(optsArg.resumePayloadDigest).toBeUndefined();
+
+    expect(queue).toHaveBeenCalledTimes(1);
+    const [, payloadArg] = queue.mock.calls[0];
+    expect(payloadArg.hookInput).toBeUndefined();
+  });
+
+  it('fails closed when a caller supplies a Hook object carrying resumeCapabilities (not freshly looked up)', async () => {
+    // The response-only `resumeCapabilities` is only trustworthy when fetched
+    // during THIS resume. A public caller passing a pre-fetched Hook object —
+    // e.g. one cached before a server rollback or kill switch, still carrying
+    // `hookResumeDedupVersion` — must NOT reactivate the parallel path against
+    // a backend that no longer dedups. Passing a Hook (not a token) skips the
+    // by-token lookup, so its capability is stale by construction and ignored.
+    const hook = {
+      ...baseHook,
+      resumeContext: parallelContext,
+      resumeCapabilities: { hookResumeDedupVersion: HOOK_RESUME_DEDUP_VERSION },
+    } satisfies Hook;
+    // Empty world capabilities (world-vercel: no static hookResumeDedup) and
+    // getByToken deliberately NOT consulted — we pass the hook object directly.
+    const { createEvent, queue } = makeWorld(hook, {}, {});
+
+    await resumeHook(hook, { foo: 'bar' });
+
+    // Sequential: no shared idempotency key, no hookInput on the queue message.
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    const [, , optsArg] = createEvent.mock.calls[0];
+    expect(optsArg.resumeId).toBeUndefined();
+    expect(optsArg.resumePayloadDigest).toBeUndefined();
+    const [, payloadArg] = queue.mock.calls[0];
+    expect(payloadArg.hookInput).toBeUndefined();
+  });
+
+  it('resumeWebhook takes the parallel path via its internal fresh attestation on a dynamic-only backend', async () => {
+    // The complement to the "caller supplies a stale Hook" fail-closed test:
+    // `resumeWebhook` fetches the hook by token in-line (`getHookByTokenWithKey`)
+    // during this resume, then calls the private `resumeHookImpl` with the
+    // freshness attestation set. That is the ONLY path allowed to trust the
+    // response-only `resumeCapabilities` on a Hook object, so with no static
+    // world capability the parallel path must still engage — proving the
+    // attestation flows through the webhook entry point (which cannot be
+    // exercised through the public three-arg `resumeHook`).
+    const hook = {
+      ...baseHook,
+      isWebhook: true,
+      resumeContext: parallelContext,
+      resumeCapabilities: { hookResumeDedupVersion: HOOK_RESUME_DEDUP_VERSION },
+    } satisfies Hook;
+    const { createEvent, queue } = makeWorld(hook, {}, {});
+
+    const response = await resumeWebhook(hook.token, new Request('http://x'));
+    // Default webhook (no `respondWith`) resolves to a 202.
+    expect(response.status).toBe(202);
+
+    // Parallel: shared idempotency key + hookInput on the queue message.
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    const [, , optsArg] = createEvent.mock.calls[0];
+    expect(optsArg.resumeId).toEqual(expect.any(String));
+    expect(optsArg.resumePayloadDigest).toMatch(/^[0-9a-f]{64}$/);
+    const [, payloadArg] = queue.mock.calls[0];
+    expect(payloadArg.hookInput).toBeDefined();
+  });
+
+  it('ignores a stale resumeCapabilities below the required dedup version', async () => {
+    // Forward-compat: a future server that lowers its attested version (or a
+    // corrupted/old field below HOOK_RESUME_DEDUP_VERSION) must not engage the
+    // parallel path — the version gate is a floor, not a mere presence check.
+    const hook = {
+      ...baseHook,
+      resumeContext: parallelContext,
+      resumeCapabilities: {
+        hookResumeDedupVersion: HOOK_RESUME_DEDUP_VERSION - 1,
+      },
+    } satisfies Hook;
+    const { createEvent, queue } = makeWorld(hook, {}, {});
+
+    await resumeHook(hook.token, { foo: 'bar' });
+
+    const [, , optsArg] = createEvent.mock.calls[0];
+    expect(optsArg.resumeId).toBeUndefined();
     const [, payloadArg] = queue.mock.calls[0];
     expect(payloadArg.hookInput).toBeUndefined();
   });

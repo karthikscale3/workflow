@@ -644,6 +644,14 @@ export const EventSchema = AllEventsSchema.and(
     createdAt: z.coerce.date(),
     occurredAt: z.coerce.date().optional(),
     specVersion: z.number().optional(),
+    /**
+     * Lazy hook resume idempotency key, persisted on `hook_received` events so
+     * the queue consumer can detect that the producer's concurrent direct write
+     * already landed in the run_started preload and skip its own re-ensure.
+     * Mirrors {@link CreateEventParams.resumeId}; absent on all other events and
+     * on legacy (non-lazy) resumes.
+     */
+    resumeId: z.string().optional(),
   })
 );
 

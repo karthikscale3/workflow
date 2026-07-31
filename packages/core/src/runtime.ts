@@ -53,6 +53,7 @@ import {
   getQueueOverhead,
   getWorkflowQueueName,
   handleHealthCheckMessage,
+  insertEventByEventId,
   isPreconditionGuardEnabled,
   loadWorkflowRunEvents,
   type MutableEventLog,
@@ -1181,57 +1182,119 @@ export function workflowEntrypoint(
                   // (that path carries `runInput`, not `hookInput`), so this
                   // only runs on the normal load-and-replay path.
                   if (hookInput) {
-                    try {
-                      await world.events.create(
-                        runId,
-                        {
-                          eventType: 'hook_received',
-                          specVersion: SPEC_VERSION_CURRENT,
-                          correlationId: hookInput.hookId,
-                          eventData: {
-                            token: hookInput.token,
-                            payload: hookInput.payload,
-                          },
-                        },
-                        {
-                          requestId,
-                          resumeId: hookInput.resumeId,
-                          resumePayloadDigest: hookInput.payloadDigest,
-                        }
+                    // Perf (Option A): if the producer's concurrent direct
+                    // write already landed in the run_started preload, the
+                    // canonical event is in the log and the re-ensure round trip
+                    // is pure overhead. Skip it when the preload already carries
+                    // a `hook_received` with this resume's persisted `resumeId`
+                    // (unique per resume, so we never skip on an unrelated
+                    // hook_received). Best-effort: the win lands only when the
+                    // producer's write beat this consumer's load; otherwise we
+                    // fall through to the idempotent re-ensure below.
+                    const alreadyPreloaded =
+                      hookInput.resumeId !== undefined &&
+                      preloadedEvents?.some(
+                        (e) =>
+                          e.eventType === 'hook_received' &&
+                          e.resumeId === hookInput.resumeId
                       );
-                    } catch (err) {
-                      // A matching concurrent claim (same resumeId + digest) is
-                      // resolved as success server-side and never throws, so
-                      // anything caught here is a genuine terminal or transient
-                      // condition:
-                      //
-                      // - HookNotFound / RunExpired: the producer's direct write
-                      //   already ended this resume's eligibility (the run went
-                      //   terminal). There is nothing left to resume, so consume
-                      //   the message and stop. Continuing to replay would be
-                      //   wasted work — and, worse, would ack a delivery that may
-                      //   carry the only copy of the payload.
-                      if (
-                        HookNotFoundError.is(err) ||
-                        RunExpiredError.is(err)
-                      ) {
-                        return;
+                    if (alreadyPreloaded) {
+                      // Event already visible in the preloaded log — nothing to
+                      // ensure or splice.
+                    } else {
+                      let ensuredEvent: Event | undefined;
+                      try {
+                        const ensured = await world.events.create(
+                          runId,
+                          {
+                            eventType: 'hook_received',
+                            specVersion: SPEC_VERSION_CURRENT,
+                            correlationId: hookInput.hookId,
+                            eventData: {
+                              token: hookInput.token,
+                              payload: hookInput.payload,
+                            },
+                          },
+                          {
+                            requestId,
+                            resumeId: hookInput.resumeId,
+                            resumePayloadDigest: hookInput.payloadDigest,
+                          }
+                        );
+                        // The canonical event — whether this call committed it or
+                        // converged on the producer's concurrent write — so we can
+                        // splice it into the preloaded log instead of discarding
+                        // the preload (see below).
+                        //
+                        // Reconstruct `eventData` from `hookInput` rather than
+                        // trusting the POST response's payload: world-vercel posts
+                        // hook_received with `remoteRefBehavior: 'lazy'`, so the
+                        // returned event's payload is a RemoteRef *descriptor*, not
+                        // the serialized bytes replay needs. `hookInput` carries
+                        // the real token + payload bytes (they rode the queue
+                        // message), so splice those onto the returned event's
+                        // stable eventId/metadata.
+                        // The re-ensure always returns a `hook_received` event, so
+                        // the splice is safe. The cast is needed because spreading
+                        // the raw `Event` union and overriding `eventData` collapses
+                        // to a non-`hook_received` member (whose `eventData` is a
+                        // different shape); the object is a genuine `hook_received`
+                        // event by construction.
+                        const base = ensured.event;
+                        ensuredEvent = base
+                          ? ({
+                              ...base,
+                              eventData: {
+                                token: hookInput.token,
+                                payload: hookInput.payload,
+                              },
+                            } as Event)
+                          : undefined;
+                      } catch (err) {
+                        // A matching concurrent claim (same resumeId + digest) is
+                        // resolved as success server-side and never throws, so
+                        // anything caught here is a genuine terminal or transient
+                        // condition:
+                        //
+                        // - HookNotFound / RunExpired: the producer's direct write
+                        //   already ended this resume's eligibility (the run went
+                        //   terminal). There is nothing left to resume, so consume
+                        //   the message and stop. Continuing to replay would be
+                        //   wasted work — and, worse, would ack a delivery that may
+                        //   carry the only copy of the payload.
+                        if (
+                          HookNotFoundError.is(err) ||
+                          RunExpiredError.is(err)
+                        ) {
+                          return;
+                        }
+                        // - EntityConflict (and any other unexpected error): the
+                        //   resumeId constraint exists but the matching event is
+                        //   not yet observable — the producer's parallel write is
+                        //   still in flight, or a redrive raced the claim. This is
+                        //   transient: rethrow so the queue redelivers and a later
+                        //   attempt converges on the committed event instead of
+                        //   replaying (and acking) without the payload.
+                        throw err;
                       }
-                      // - EntityConflict (and any other unexpected error): the
-                      //   resumeId constraint exists but the matching event is
-                      //   not yet observable — the producer's parallel write is
-                      //   still in flight, or a redrive raced the claim. This is
-                      //   transient: rethrow so the queue redelivers and a later
-                      //   attempt converges on the committed event instead of
-                      //   replaying (and acking) without the payload.
-                      throw err;
-                    }
-                    // The run_started response preloaded the log BEFORE this
-                    // ensure, so it cannot include the hook_received. Drop the
-                    // preloaded set to force a fresh events.list that observes
-                    // the committed event on the first replay iteration.
-                    preloadedEvents = undefined;
-                    preloadedEventsCursor = undefined;
+                      // The run_started response preloaded the log BEFORE this
+                      // ensure, so it cannot include the hook_received. Rather
+                      // than discard the preload (which would cost a fresh
+                      // events.list round trip on the first replay iteration),
+                      // splice in the canonical event reconstructed above. It
+                      // carries a stable eventId, so `insertEventByEventId` keeps
+                      // it in ascending eventId order (preloadedEvents load
+                      // `sortOrder: 'asc'` and are not re-sorted client-side) and
+                      // is idempotent even if a later list re-observes it. Only
+                      // when the World returns no event (older backend) do we fall
+                      // back to dropping the preload so a fresh list observes it.
+                      if (preloadedEvents && ensuredEvent) {
+                        insertEventByEventId(preloadedEvents, ensuredEvent);
+                      } else {
+                        preloadedEvents = undefined;
+                        preloadedEventsCursor = undefined;
+                      }
+                    } // end else (re-ensure needed)
                   }
 
                   // Resolve the encryption key for this run's deployment.

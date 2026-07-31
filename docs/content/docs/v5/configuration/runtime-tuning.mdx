@@ -38,6 +38,16 @@ For example, a workflow can run a 10-minute inline step even with `WORKFLOW_REPL
 - Default: `3`
 - Recovery replays before replay divergence is recorded as corruption.
 
+### `WORKFLOW_DISABLE_LAZY_HOOK_RESUME`
+
+- Default: enabled (lazy hook resume on)
+- Resuming a hook normally persists the `hook_received` event and publishes the workflow invocation concurrently, cutting a round trip off resume latency. The queue consumer re-ensures the event on replay, so a lost event write still resumes the run.
+- Set `1` to force the sequential path (persist the event, then publish) — an operational kill switch if the fast path ever misbehaves. This is an environment variable on the workflow deployment, so changing it generally requires redeploying that deployment to take effect.
+- The fast path is taken only when two conditions are attested, and every rollout/rollback direction degrades safely to the sequential path:
+  - The **target consumer** re-ensures the event from the queue message. This marker is fixed per run — stamped into the run's execution context when the run starts (for a cross-deployment start it is carried over the same health-check probe used for other capabilities, so an older target deployment that would ignore the re-enqueued input is detected and the marker is omitted). It does not change over the life of the run.
+  - The **backend** enforces the `(runId, resumeId)` idempotency constraint. Unlike the consumer marker, this is re-evaluated fresh on every hook lookup, so a server-side rollback takes effect on the next resume with no stranded hooks.
+- This flag disables the fast path unconditionally on the SDK side. The chosen strategy is reported on the resume span as `workflow.hook.resume_strategy`, with `workflow.hook.resume_fallback_reason` naming why the sequential path was taken.
+
 ### `WORKFLOW_PRECONDITION_GUARD`
 
 - Default: enabled
